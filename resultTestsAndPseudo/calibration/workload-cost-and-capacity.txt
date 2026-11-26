@@ -1,0 +1,564 @@
+Workload cost and worker capacity calibration
+=============================================
+
+Goal
+----
+
+The LB/AS needs one common overload metric for Fractals, Gray-Scott, and DNA.
+We use two separate concepts:
+
+    workloadCost:
+        A stable calibrated complexity score for one request.
+
+    workloadCapacity:
+        The maximum amount of workloadCost that one worker can safely hold
+        before latency becomes unacceptable.
+
+Although duration is used to fit and validate the formulas, duration is not
+stored in MSS and is not used directly as an operational metric. The runtime
+LB stores and predicts stable metrics such as instructions, memory accesses,
+allocated bytes, and request parameters. These are converted into
+workloadCost, then normalized by the calibrated worker capacity.
+
+The workloadCost values have a local-millisecond-like scale because they were
+fitted against local WebServer durations, but operationally we treat them as
+dimensionless capacity units. This keeps the design defensible even if we do
+not want to call the scheduling metric "expected execution time".
+
+
+Step 1: collect calibration data
+--------------------------------
+
+Each workload was run through the instrumented WebServer, not through CLI
+startup runs. For every calibration request we collected:
+
+    parameters
+    instructions
+    memoryAccesses
+    allocatedBytes
+    durationMillis
+
+The duration column is calibration-only. It is used inside the XLSX files to
+fit and compare workloadCost formulas. It is not part of the normal MSS
+prediction path.
+
+
+Step 2: choose a defensible workloadCost formula
+------------------------------------------------
+
+For each workload, we compared the fitted workloadCost with an
+instructions-only alternative. The updated XLSX files include these R^2 values.
+
+Fractals
+~~~~~~~~
+
+Fractals are mostly explained by instructions, but image size also matters.
+Large images still pay for image allocation, pixel writes, encoding, and
+response generation even when the iteration count is small.
+
+    instructionsMillions = instructions / 1_000_000
+    pixelsMillions       = pixels / 1_000_000
+
+    workloadCost =
+        max(25,
+            -33.7459
+          + 0.1456643013 * instructionsMillions
+          + 30.941477    * pixelsMillions)
+
+Evidence from fractals-calibration-metrics.xlsx:
+
+    R^2(duration, workloadCost)     = 0.9979375
+    R^2(duration, instructionsOnly) = 0.9958526
+    corr(instructions, memoryAccesses) = 0.9331598
+
+The pixel term is kept because it improves the model and is easy to justify
+from the workload structure. Memory accesses are not included because they are
+strongly correlated with instructions and do not add enough independent signal.
+
+
+Gray-Scott
+~~~~~~~~~~
+
+Gray-Scott is instruction-dominated. The number of executed simulation steps is
+already reflected in the instruction count, and memory accesses are almost
+perfectly correlated with instructions.
+
+Evidence from grayscott-calibration-metrics.xlsx:
+
+    R^2(duration, workloadCost)     = 0.9997974
+    R^2(duration, instructionsOnly) = 0.9997974
+    corr(instructions, memoryAccesses) = 0.9999998
+
+Therefore, the final workloadCost for Gray-Scott is simply instructions. To
+keep the numbers readable in tables, we use instruction-million units:
+
+    workloadCost =
+        instructions / 1_000_000
+
+The fitted linear transform:
+
+    3.5584027 + 1.81555916048485e-7 * instructions
+
+is useful as calibration evidence, but it does not add a new feature. For the
+operational normalized-capacity model, Gray-Scott uses instructions as its
+workloadCost.
+
+
+DNA
+~~~
+
+DNA is not sufficiently explained by instructions alone. The calibration shows
+that the amount of candidate substring/comparison work is also important.
+
+    candidatePairs =
+        max(0, sequence1Length - minLength + 1)
+      * max(0, sequence2Length - minLength + 1)
+
+    pairWorkMillions = candidatePairs * minLength / 1_000_000
+    instructionsMillions = instructions / 1_000_000
+
+    workloadCost =
+        146.4859784
+      + 0.2799395964 * instructionsMillions
+      + 0.0673526939 * pairWorkMillions
+
+Evidence from dna-calibration-metrics.xlsx:
+
+    R^2(duration, workloadCost)     = 0.9916706
+    R^2(duration, instructionsOnly) = 0.8563279
+    R^2(duration, pairWorkOnly)     = 0.9801229
+
+This is the strongest case for a workload-specific raw cost. Instructions
+capture measured bytecode-level work, while pairWork captures candidate matching and
+substring/comparison work that the instruction counter does not fully explain.
+Memory accesses are not included because they did not provide a stable
+independent predictor for DNA.
+
+
+Step 3: measure worker saturation capacity
+------------------------------------------
+
+After defining workloadCost, we measured how much of it one worker can hold
+before latency becomes unacceptable.
+
+The saturation tests used one representative medium request per workload and
+ran increasing backlog sizes on a worker-like local environment:
+
+    WSL2 memory=1GB
+    WSL2 processors=2
+    swap=0
+    stressMode=backlog
+    maxInFlight=2
+    repetitions=2
+    unacceptable threshold: p95 >= 180_000 ms
+
+This means every saturation run keeps at most two active HTTP requests running
+at the same time. Higher requestedConcurrency values represent a larger backlog
+queued against the same two active worker slots, which is closer to how a
+2-vCPU worker becomes saturated than launching dozens of requests at exactly
+the same instant.
+
+This is a calibration setup, not the runtime admission cap. At runtime we allow
+up to four active requests per EC2 worker. Although the worker has 2 vCPUs,
+allowing up to two extra active requests exploits I/O, memory-access, and
+networking slack without aggressively overcommitting the small t3.micro memory
+envelope. Using more than four active requests would provide little extra
+benefit for our target workloads and increases the risk of GC pressure or OOM,
+so the final runtime limit is:
+
+    MAX_CONCURRENT_PER_WORKER = 4
+
+For each backlog size, the stress script records:
+
+    p50Millis
+    p95Millis
+    maxMillis
+    requestWorkloadCost
+    waveWorkloadCost = requestedConcurrency * requestWorkloadCost
+    waveInstructionsMillions
+    wavePixelsMillions       (Fractals)
+    wavePairWorkMillions     (DNA)
+
+The conservative capacity is the largest waveWorkloadCost whose decision is
+still "ok". The XLSX files also compute a less conservative forecast capacity:
+
+    p95_180s_forecast =
+        forecasted concurrency where p95 reaches 180 seconds
+
+    forecastWorkloadCapacity =
+        p95_180s_forecast * requestWorkloadCost
+
+
+Step 4: resulting capacities
+----------------------------
+
+Fractals saturation
+~~~~~~~~~~~~~~~~~~~
+
+Representative request:
+
+    width=3200, height=3200, maxIterations=1000
+    requestWorkloadCost = 2767.282
+    requestInstructionsMillions = 17054.229993
+    requestPixelsMillions = 10.24
+
+Measured last-safe capacity:
+
+    requestedConcurrency = 160
+    workloadCapacity = 442765.12
+
+Forecast at p95=180s:
+
+    p95_180s_forecast = 164.7000337
+    workloadCapacity = 455771.4386
+    instructionsMillionsCapacity = 2808832.2541
+    pixelsMillionsCapacity = 1686.5283
+
+
+Gray-Scott saturation
+~~~~~~~~~~~~~~~~~~~~~
+
+Representative request:
+
+    size=256, maxIterations=1000, f=0.03, k=0.062
+    stopOnExtinction=false, seedMode=stripe
+    requestWorkloadCost = requestInstructionsMillions = 17908.868413
+
+Measured last-safe capacity:
+
+    requestedConcurrency = 96
+    workloadCapacity = 1719251.3676 instruction-million units
+
+Forecast at p95=180s:
+
+    p95_180s_forecast = 109.2490094
+    workloadCapacity = 1956526.1329 instruction-million units
+
+
+DNA saturation
+~~~~~~~~~~~~~~
+
+Representative request:
+
+    sequence1=sars-10k
+    sequence2=human-mc-10k
+    sequence1Length=10000
+    sequence2Length=10000
+    minLength=500
+    stopOnFirst=false
+    requestWorkloadCost = 3616.161848
+    requestInstructionsMillions = 1535.085504
+    requestPairWorkMillions = 45134.5005
+
+Measured last-safe capacity:
+
+    requestedConcurrency = 96
+    workloadCapacity = 347151.5374
+
+Forecast at p95=180s:
+
+    p95_180s_forecast = 110.4837355
+    workloadCapacity = 399527.0690
+    instructionsMillionsCapacity = 169601.9807
+    pairWorkMillionsCapacity = 4986628.2134
+
+
+Step 5: runtime use in the LB/AS
+--------------------------------
+
+At runtime, the LB follows this process:
+
+    1. Estimate stable complexity metrics for the request:
+
+           instructions
+           memoryAccesses
+           allocatedBytes
+
+       The workload-specific heuristic is always used as the request-specific
+       baseline. If MSS has enough samples for the snapped region, the LB uses
+       the region average as a confidence-weighted correction:
+
+           samples < 3:   use heuristic only
+           samples 3-9:   50% heuristic, 50% MSS average
+           samples 10-29: 25% heuristic, 75% MSS average
+           samples >= 30: 10% heuristic, 90% MSS average
+
+       This avoids a hard switch from heuristic to MSS after only a few
+       samples. MSS averages are real measurements, but they are still region
+       averages, not exact measurements for the current request.
+
+       The same confidence-weighted correction is used for allocatedBytes.
+       The resulting allocatedBytes estimate is still converted into
+       estimated live/peak memory and multiplied by the memory safety factor
+       before admission, so memory remains conservative even though MSS is
+       blended gradually.
+
+    2. Convert stable metrics and request parameters into workloadCost using
+       the workload-specific formula.
+
+    3. Estimate live/peak request memory separately from allocatedBytes.
+       Memory is not folded into workloadCost.
+
+    4. Normalize by the calibrated worker capacity, adjusted for EC2 speed:
+
+           requestLoadFraction =
+               workloadCost * T3_MICRO_SLOWDOWN_FACTOR[workload]
+               / WORKLOAD_CAPACITY[workload]
+
+       Equivalently:
+
+           effectiveWorkerCapacity =
+               WORKLOAD_CAPACITY[workload]
+               / T3_MICRO_SLOWDOWN_FACTOR[workload]
+
+           requestLoadFraction =
+               workloadCost / effectiveWorkerCapacity
+
+    5. Track worker load as the sum of unfinished assigned normalized
+       fractions. This includes requests actively running on the worker and
+       requests already assigned to that worker but waiting for an execution
+       slot:
+
+           workerLoad =
+               sum(requestLoadFraction for unfinished requests assigned
+                   to worker)
+
+       For reporting, this can be shown as a percentage:
+
+           workerLoadPercent = 100 * workerLoad
+
+       In the implementation this fraction is stored as fixed-point integer
+       load units:
+
+           WORKER_LOAD_CAPACITY_UNITS = 1_000_000
+
+           requestLoadUnits =
+               ceil(requestLoadFraction * WORKER_LOAD_CAPACITY_UNITS)
+
+       Therefore:
+
+           1_000_000 load units = 100% of one worker
+             500_000 load units =  50% of one worker
+
+       The workload-specific capacities are not separate worker capacities.
+       They are the denominators that convert each workload's raw
+       workloadCost into a common fraction of one worker. Once converted, all
+       workloads are comparable because they reserve the same normalized unit:
+       a percentage of one worker's calibrated capacity.
+
+       Queued assigned requests reserve workload load immediately, but they do
+       not reserve active memory until they acquire an execution slot and are
+       forwarded to the worker.
+
+       The LB uses two different wait budgets:
+
+           LOAD_RESERVE_WAIT_TIMEOUT_MS = 30_000
+           EXECUTION_SLOT_WAIT_TIMEOUT_MS = 90_000
+
+       The load-reservation wait is short because a request that cannot reserve
+       load has not entered the calibrated worker backlog yet. The execution
+       slot wait is longer because an assigned request is already part of the
+       worker's unfinished backlog; 90 seconds allows queueing under the
+       p95=180s saturation model while still leaving time for execution before
+       latency becomes unacceptable.
+
+This gives the scheduler one common mixed-workload metric:
+
+    CPU/complexity admission is safe if:
+
+        workerLoad + requestLoadFraction <= 1.0
+
+The runtime worker also has a small hard concurrency guard:
+
+    activeRequests < MAX_CONCURRENT_PER_WORKER
+
+with:
+
+    MAX_CONCURRENT_PER_WORKER = 4
+
+This avoids treating the 2-vCPU worker as only two strict execution slots, while
+the workload-capacity and memory-admission checks still prevent unsafe
+co-scheduling on a memory-constrained t3.micro.
+
+Memory remains a separate active-execution constraint:
+
+    outstandingEstimatedMemoryBytes + requestEstimatedMemoryBytes
+        <= EC2_MEMORY_ADMISSION_CAPACITY_BYTES
+
+This is checked when a request is about to acquire an execution slot, not when
+it is merely queued as unfinished assigned work.
+
+The AS uses the same normalized workerLoad values:
+
+    scale out when average or maximum workerLoad is high for sustained cycles
+    scale in when average and maximum workerLoad stay low for sustained cycles
+
+
+Memory concurrency policy
+-------------------------
+
+We also ran memory stress tests, especially for Fractals, using the
+allocated-to-live-memory heuristics. The goal was to see whether the LB could
+pack multiple concurrent requests more aggressively while still avoiding OOM.
+
+Those tests showed that memory behavior is more volatile than CPU/complexity
+capacity. Running multiple large requests at once can fail abruptly depending
+on heap pressure, response buffers, instrumentation overhead, and JVM/OS
+state. The small possible improvement from packing large memory-heavy requests
+was not worth the risk of crashing the worker.
+
+Therefore, memory is used conservatively:
+
+    EC2 request-memory envelope = 512 MiB
+    memory admission utilization limit = 0.65
+    active-memory admission cap = 332.8 MiB
+    memory safety factor = 1.25
+
+The 512 MiB envelope is the total request-memory budget reserved for workload
+requests on the worker. This is already lower than the t3.micro's full memory,
+because the OS, JVM baseline, non-heap memory, thread stacks, instrumentation,
+HTTP buffers, and response encoding also need headroom.
+
+The active-memory admission cap is the limit actually enforced by the LB:
+
+    0.65 * 512 MiB = 332.8 MiB
+
+This means the LB does not try to fill the whole 512 MiB request-memory
+envelope. It only allows active forwarded requests whose combined estimated
+live/peak memory stays under the 65% cap.
+
+For a request, the LB first converts cumulative allocatedBytes into estimated
+live/peak memory with the workload-specific memory heuristic, then applies the
+25% safety factor:
+
+    estimatedMemoryForAdmission =
+        memoryAllocatedToMemoryUsed(workload, params, allocatedBytes) * 1.25
+
+The LB uses this estimate to avoid unsafe active execution:
+
+    outstandingEstimatedMemoryForAdmission
+      + requestEstimatedMemoryForAdmission
+        <= 0.65 * 512 MiB
+
+We still keep the memory heuristic because it is useful for blocking unsafe concurrent placement, 
+but we do not try to use it for tight memory packing.
+
+In short:
+
+    EC2_MEMORY_CAPACITY_BYTES = 512 MiB
+    MEMORY_ADMISSION_UTIL_LIMIT = 0.65
+    EC2_MEMORY_ADMISSION_CAPACITY_BYTES = 0.65 * 512 MiB
+    MEMORY_SAFETY_FACTOR = 1.25
+
+    estimatedMemoryBytes =
+        memoryAllocatedToMemoryUsed(...) * 1.25
+
+
+Capacity choice and EC2 slowdown
+--------------------------------
+
+There are two defensible capacity choices:
+
+    Conservative:
+        Use the measured last-safe workloadCapacity.
+
+    Less conservative:
+        Use the p95=180s forecast workloadCapacity.
+
+For the final deployment we use the less conservative forecast capacity values,
+because they estimate the saturation point directly instead of stopping at the
+last measured concurrency step:
+
+    Fractals:  455771.4386
+    GrayScott: 1956526.1329 instruction-million units
+    DNA:       399527.0690
+
+The conservative last-safe values remain useful as supporting evidence:
+
+    Fractals:  442765.12
+    GrayScott: 1719251.3676 instruction-million units
+    DNA:       347151.5374
+
+A t3.micro worker may process the same workloadCost more slowly than our local runs. 
+We therefore keep an explicit slowdown factor:
+
+    T3_MICRO_SLOWDOWN_FACTOR[workload] >= 1.0
+
+For the final deployment, we use:
+
+    T3_MICRO_SLOWDOWN_FACTOR = 2.0
+
+This assumes that the t3.micro may take up to roughly twice as long as the
+local WSL calibration environment for the same workloadCost. This is
+realistic because the t3.micro is a small burstable instance with 2 vCPUs and
+1 GiB of RAM, while the local machine has a much stronger CPU. The factor is
+also intentionally conservative:
+underestimating load can cause queueing and OOM risk, while overestimating load
+mostly causes earlier scale-out or Lambda fallback.
+
+The slowdown may vary with CPU credits. If the t3.micro has enough credits, a
+2.0 factor is a reasonable approximation. If credits are depleted, the worker
+may become much slower, so the AS should still react to sustained high load.
+
+This factor is applied to the request load fraction:
+
+    requestLoadFraction =
+        workloadCost * T3_MICRO_SLOWDOWN_FACTOR[workload]
+        / FORECAST_WORKLOAD_CAPACITY[workload]
+
+Example:
+
+    If T3_MICRO_SLOWDOWN_FACTOR = 2.0, then a request consumes twice as much of
+    the worker's calibrated capacity as it did in the local WSL stress test.
+
+The factor should be replaced by a small EC2 reference batch when available:
+
+    T3_MICRO_SLOWDOWN_FACTOR[workload] =
+        median(ec2RequestDuration / localRequestDuration)
+
+If only one short EC2 batch is available, use a single shared slowdown factor
+for all workloads. If enough EC2 samples are available, use one factor per
+workload.
+
+The LB/AS therefore uses percentages of worker capacity:
+
+    Fractals request percent =
+        100 * fractalsWorkloadCost * slowdownFractals / 455771.4386
+
+    Gray-Scott request percent =
+        100 * grayScottInstructionsMillions * slowdownGrayScott / 1956526.1329
+
+    DNA request percent =
+        100 * dnaWorkloadCost * slowdownDna / 399527.0690
+
+The worker's CPU/complexity load is the sum of these percentages over active
+and queued/reserved unfinished requests assigned to the worker.
+
+The forecast capacity is a saturation reference, not the scale-out threshold.
+The AS still reacts earlier, using sustained average and maximum worker-load
+thresholds before a worker reaches 100% of the forecast p95=180s capacity.
+
+
+Report wording
+--------------
+
+The final design can be summarized as:
+
+    We estimate a stable workload-specific cost from instrumentation metrics
+    and request parameters. For Fractals, the cost combines instructions and
+    pixels; for Gray-Scott, instructions alone are sufficient; for DNA, the
+    cost combines instructions and candidatePairs * minLength. The choice of
+    features was validated by comparing R^2 against instructions-only models.
+    We then stress tested one 2-vCPU/1GB worker approximation with two active
+    concurrent requests and increasing backlog sizes, then used a p95=180s
+    forecast to estimate each workload's worker capacity. Because the local
+    machine is faster than a t3.micro, the runtime LB multiplies each request's
+    normalized load fraction by a t3.micro slowdown factor. At runtime, we
+    allow up to four active requests per worker. This uses slack beyond the two
+    vCPUs without making four an unconditional admission rule. Each request
+    consumes a percentage of one worker's calibrated capacity, and the LB sums
+    these percentages across unfinished assigned requests, including active and
+    queued/reserved requests. Memory remains a separate active-execution
+    conservative admission constraint: the LB estimates live/peak memory from
+    allocatedBytes, applies a 25% safety factor, and prevents concurrent
+    placement above 65% of the 512 MiB request-memory envelope.

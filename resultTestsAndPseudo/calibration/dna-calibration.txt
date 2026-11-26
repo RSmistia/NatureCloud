@@ -1,0 +1,85 @@
+DNA calibration and workload-cost model
+=======================================
+
+Goal
+----
+
+DNA is the most content-dependent workload. The LB therefore uses both measured
+instrumentation metrics and request-parameter structure to estimate a
+workloadCost. As with the other workloads, wall-clock duration is used only
+during calibration and is not stored as an operational MSS prediction metric.
+
+The calibration workbook is:
+
+    lb_as/calibration/dna-calibration-metrics.xlsx
+
+Calibration data
+----------------
+
+The calibration was run through the instrumented local WebServer. For each
+request we collected:
+
+    sequence1Name
+    sequence2Name
+    sequence1Length
+    sequence2Length
+    minLength
+    stopOnFirst
+    instructions
+    memoryAccesses
+    allocatedBytes
+    durationMillis
+
+The workload set includes the reference DNA requests plus
+interpolation cases around the 10k, 20k, and 25k sequence sizes.
+
+Derived variables
+-----------------
+
+Instruction count alone was not enough for DNA because substring comparisons
+and allocations are not fully represented by the bytecode counter. To capture
+that extra work, we compute:
+
+    candidatePairs =
+        max(0, sequence1Length - minLength + 1)
+      * max(0, sequence2Length - minLength + 1)
+
+    pairWork = candidatePairs * minLength
+
+candidatePairs estimates how many possible seed positions exist. Multiplying
+by minLength approximates the amount of substring/comparison work per
+candidate.
+
+Fitted workload-cost model
+--------------------------
+
+The Excel regression uses:
+
+    instructionsMillions = instructions / 1_000_000
+    pairWorkMillions     = pairWork / 1_000_000
+
+The fitted model uses local duration as the calibration target, but the
+deployed LB treats the result as workloadCost:
+
+    workloadCost ~= 146.486
+                    + 0.27994  * instructionsMillions
+                    + 0.067353 * pairWorkMillions
+
+Equivalent unscaled form:
+
+    workloadCost ~= 146.486
+                    + 2.7994e-7 * instructions
+                    + 6.7353e-8 * pairWork
+
+Calibration quality:
+
+    R^2:          ~0.9917
+    adjusted R^2: ~0.9915
+    MAE:          ~277 ms
+    RMSE:         ~386 ms
+
+Both variables are useful. The instruction term captures measured algorithmic
+work, while pairWork captures substring/comparison/allocation work.
+
+Memory accesses were not included in the final DNA workload-cost model because
+they did not provide a stable independent signal.

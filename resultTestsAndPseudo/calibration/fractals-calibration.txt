@@ -1,0 +1,77 @@
+Fractals calibration and workload-cost model
+============================================
+
+Goal
+----
+
+For Fractals, the LB needs a stable request cost before the request has
+actually run. The final workloadCost is based on stable request complexity
+metrics, not on past wall-clock duration stored in MSS.
+
+The calibration workbook is:
+
+    lb_as/calibration/fractals-calibration-metrics.xlsx
+
+Calibration data
+----------------
+
+The calibration was run through the instrumented local WebServer. For each
+request we collected:
+
+    width
+    height
+    pixels = width * height
+    maxIterations
+    instructions
+    memoryAccesses
+    allocatedBytes
+    durationMillis
+
+durationMillis is used only in the calibration workbook. It is not an
+operational MSS metric.
+
+What we learned
+---------------
+
+Instruction count is the main CPU-cost signal, but it is not enough by itself.
+Large images with low iteration counts still have image-size overhead: image
+allocation, pixel writes, PNG/base64 response generation, and fixed handler
+work.
+
+Memory accesses were not used in the final duration model because they are
+strongly correlated with instruction count:
+
+    corr(instructions, memoryAccesses) ~= 0.933
+
+So memory accesses are stored as a stable metric, but they do not add an
+independent duration signal for Fractals.
+
+Fitted workload-cost model
+--------------------------
+
+The Excel regression uses:
+
+    instructionsMillions = instructions / 1_000_000
+    pixelsMillions       = pixels / 1_000_000
+
+The fitted model uses local duration as the calibration target, but the
+deployed LB treats the result as workloadCost:
+
+    workloadCost ~= -33.7459
+                    + 0.145664 * instructionsMillions
+                    + 30.941477 * pixelsMillions
+
+Because negative or very small estimates are not useful for scheduling, the
+deployed estimator applies a minimum floor:
+
+    workloadCost = max(25,
+                       -33.7459
+                     + 0.145664 * instructions / 1_000_000
+                     + 30.941477 * pixels / 1_000_000)
+
+Calibration quality:
+
+    R^2:         ~0.9979
+    adjusted R^2 ~0.9979
+    MAE:         ~64 ms
+    RMSE:        ~96 ms

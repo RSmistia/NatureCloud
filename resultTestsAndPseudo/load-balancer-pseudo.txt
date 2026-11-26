@@ -1,0 +1,404 @@
+# LB
+
+on request arrival(request):
+    workload = parse path
+    params = parse query parameters
+
+    prediction = estimateRequest(workload, params)
+    requestCost = prediction.estimatedInstructions
+    requestMemory = prediction.estimatedMemoryUsed
+
+    candidates = ACTIVE healthy workers
+
+    if candidates is empty:
+        if Lambda is enabled and lambdaSuitable(request, prediction):
+            invoke Lambda
+            return Lambda response
+        else:
+            return temporary failure
+
+    totalLoad = sum outstandingEstimatedLoad(worker) for ACTIVE workers
+    clusterCapacity = number of ACTIVE workers × EC2_CAPACITY
+    clusterUtilization = totalLoad / clusterCapacity
+
+    if clusterUtilization >= HIGH_UTILIZATION:
+        mode = SPREADING
+
+    else if clusterUtilization <= LOW_UTILIZATION:
+        mode = PACKING
+
+    else:
+        keep previous mode, or default to SPREADING
+
+    eligibleWorkers = ACTIVE healthy workers satisfying:
+        outstandingEstimatedLoad(worker) + requestCost <= EC2_CAPACITY
+        and outstandingEstimatedMemory(worker) + requestMemory <= EC2_MEMORY_CAPACITY
+        and activeRequestCount(worker) < MAX_CONCURRENT_REQUESTS_PER_WORKER
+
+    if eligibleWorkers is empty:
+        if Lambda is enabled and lambdaSuitable(request, prediction):
+            invoke Lambda
+            return Lambda response
+        else:
+            worker = ACTIVE healthy worker with smallest outstandingEstimatedLoad
+                // best-effort fallback if Lambda is unavailable - overload
+
+    else if mode == SPREADING:
+        worker = eligible worker with smallest outstandingEstimatedLoad
+
+    else if mode == PACKING:
+        worker = busiest eligible worker
+
+    registeredWorker = worker
+    register request as active on registeredWorker:
+        add requestCost to outstandingEstimatedLoad
+        add requestMemory to outstandingEstimatedMemory
+        increment activeRequestCount
+
+    try:
+        forward request to registeredWorker
+        return worker response
+
+    catch forwarding failure:
+        failedWorker = registeredWorker
+        mark failedWorker as UNHEALTHY
+
+        remove request from registeredWorker:
+            subtract requestCost from outstandingEstimatedLoad
+            subtract requestMemory from outstandingEstimatedMemory
+            decrement activeRequestCount
+
+        registeredWorker = null
+
+        retryCandidates = ACTIVE healthy workers excluding failedWorker satisfying:
+            outstandingEstimatedLoad(worker) + requestCost <= EC2_CAPACITY
+            and outstandingEstimatedMemory(worker) + requestMemory <= EC2_MEMORY_CAPACITY
+            and activeRequestCount(worker) < MAX_CONCURRENT_REQUESTS_PER_WORKER
+
+        if retryCandidates is not empty:
+            retryWorker = retry candidate with smallest outstandingEstimatedLoad
+            registeredWorker = retryWorker
+
+            register request as active on registeredWorker
+
+            try:
+                forward request to registeredWorker
+                return retry response
+
+            finally:
+                remove request from registeredWorker
+                registeredWorker = null
+
+        else if Lambda is enabled and lambdaSuitable(request, prediction):
+            invoke Lambda
+            return Lambda response
+
+        else:
+            return failure
+
+    finally:
+        if registeredWorker is not null:
+            remove request from registeredWorker:
+                subtract requestCost from outstandingEstimatedLoad
+                subtract requestMemory from outstandingEstimatedMemory
+                decrement activeRequestCount
+
+# AS
+
+AS state:
+    highLoadCycles = 0
+    lowLoadCycles = 0
+    lastScaleOutTime = -infinity
+    lastScaleInTime = -infinity
+
+scaleOutCooldownPassed:
+    now - lastScaleOutTime >= SCALE_OUT_COOLDOWN
+
+scaleInCooldownPassed:
+    now - lastScaleInTime >= SCALE_IN_COOLDOWN
+
+every SCALE_INTERVAL:
+    refresh worker health states
+
+    for each STARTING worker:
+        if health check passes:
+            mark worker as ACTIVE
+
+    activeWorkers = workers in ACTIVE
+    startingWorkers = workers in STARTING
+
+    if activeWorkers is empty and startingWorkers is empty:
+        launch new worker as STARTING
+        return
+
+    if activeWorkers is empty and startingWorkers is not empty:
+        return
+
+    totalLoad = sum outstandingEstimatedLoad(worker) for ACTIVE workers
+    maxLoad = max outstandingEstimatedLoad(worker) among ACTIVE workers
+
+    totalMemory = sum outstandingEstimatedMemory(worker) for ACTIVE workers
+    maxMemory = max outstandingEstimatedMemory(worker) among ACTIVE workers
+
+    clusterCapacity = activeWorkers.size × EC2_CAPACITY
+    memoryCapacity = activeWorkers.size × EC2_MEMORY_CAPACITY
+
+    avgUtilization = totalLoad / clusterCapacity
+    maxUtilization = maxLoad / EC2_CAPACITY
+
+    avgMemoryUtilization = totalMemory / memoryCapacity
+    maxMemoryUtilization = maxMemory / EC2_MEMORY_CAPACITY
+
+    if avgUtilization > SCALE_OUT_AVG_THRESHOLD
+       or maxUtilization > SCALE_OUT_MAX_THRESHOLD
+       or avgMemoryUtilization > SCALE_OUT_AVG_THRESHOLD
+       or maxMemoryUtilization > SCALE_OUT_MAX_THRESHOLD:
+        highLoadCycles += 1
+    else:
+        highLoadCycles = 0
+
+    if avgUtilization < SCALE_IN_AVG_THRESHOLD
+       and maxUtilization < SCALE_IN_MAX_THRESHOLD
+       and avgMemoryUtilization < SCALE_IN_AVG_THRESHOLD
+       and maxMemoryUtilization < SCALE_IN_MAX_THRESHOLD:
+        lowLoadCycles += 1
+    else:
+        lowLoadCycles = 0
+
+    if highLoadCycles >= SCALE_OUT_REQUIRED_CYCLES:
+        if activeWorkers.size + startingWorkers.size < MAX_WORKERS
+           and scaleOutCooldownPassed:
+            launch new worker as STARTING
+            lastScaleOutTime = now
+            highLoadCycles = 0
+
+    if lowLoadCycles >= SCALE_IN_REQUIRED_CYCLES:
+        if activeWorkers.size > MIN_WORKERS
+           and scaleInCooldownPassed:
+            victim = ACTIVE worker with lowest outstandingEstimatedLoad
+            mark victim as DRAINING
+            lastScaleInTime = now
+            lowLoadCycles = 0
+
+    for each DRAINING worker:
+        if activeRequestCount(worker) == 0:
+            terminate worker
+            mark worker as TERMINATED
+
+# Cost prediction
+
+estimateRequest(workload, params):
+    heuristicInstructions = heuristicInstructionEstimate(workload, params)
+    heuristicMemAllocated = heuristicAllocatedMemory(workload, params)
+    heuristicMemoryUsed = memoryAllocatedToMemoryUsed(workload, params, heuristicMemAllocated)
+
+    rawKey = buildMssRawKey(workload, params)
+    regionKey = snapToRegion(workload, rawKey)
+    cacheKey = (workload, regionKey)
+
+    stats = predictionCache.get(cacheKey)
+
+    if stats is missing:
+        asyncRefreshRegionFromMSS(workload, regionKey)
+
+        return RequestPrediction(
+            estimatedInstructions = heuristicInstructions,
+            estimatedMemoryUsed = heuristicMemoryUsed
+        )
+
+    if stats.sampleCount < MIN_REGION_SAMPLES:
+        return RequestPrediction(
+            estimatedInstructions = heuristicInstructions,
+            estimatedMemoryUsed = heuristicMemoryUsed
+        )
+
+    mssInstructions = stats.avgInstructions
+    mssMemoryAllocated = stats.avgMemoryAllocated
+    mssMemoryUsed = memoryAllocatedToMemoryUsed(workload, params, mssMemoryAllocated)
+
+    estimatedInstructions = 0.6 × heuristicInstructions + 0.4 × mssInstructions
+    estimatedMemoryUsed = max(heuristicMemoryUsed, mssMemoryUsed)
+
+    return RequestPrediction(
+        estimatedInstructions = estimatedInstructions,
+        estimatedMemoryUsed = estimatedMemoryUsed
+    )
+
+buildMssRawKey(workload, params):
+
+    if workload == fractals:
+        return width × height × maxIterations
+
+    if workload == grayScott:
+        return size² × maxIterations
+
+    if workload == dna:
+        return seq1Length × seq2Length × minLength
+
+asyncRefreshRegionFromMSS(workload, regionKey):
+    if refresh already running for (workload, regionKey):
+        return
+
+    region = MSS.getRegion(workload, regionKey)
+
+    if region exists:
+        predictionCache[(workload, regionKey)] = {
+            avgInstructions = region.avgInstructions
+            avgMemoryAccesses = region.avgMemoryAccesses
+            avgMemoryAllocated = region.avgMemoryAllocated
+            sampleCount = region.sampleCount
+            lastRefresh = now
+        }
+
+# Workload Heuristics
+
+heuristicInstructionEstimate(workload, params):
+
+    if workload == fractals:
+        pixels = width × height
+
+        if iterations <= 1: ipp = 160
+        else if iterations <= 10: ipp = 460
+        else if iterations <= 25: ipp = 740
+        else if iterations <= 50: ipp = 1090
+        else if iterations <= 100: ipp = 1440
+        else if iterations <= 250: ipp = 1650
+        else: ipp = 1660
+
+        return pixels × ipp
+
+
+    if workload == grayScott:
+        if stopOnExtinction == false:
+            N_eff = maxIterations
+        else:
+            N_eff = estimateGrayScottNEff(f, k, seedMode, maxIterations)
+
+        return 273 × size² × N_eff
+
+
+    if workload == dna:
+        seq1Candidates = max(0, seq1Length - minLength + 1)
+        seq2Candidates = max(0, seq2Length - minLength + 1)
+        candidatePairs = seq1Candidates × seq2Candidates
+
+        if candidatePairs == 0:
+            return 200
+
+        if stopOnFirst and minLength <= 3:
+            return 2_000
+
+        if stopOnFirst and minLength <= 25:
+            return 155 × seq2Length
+
+        if minLength >= 100:
+            return 200 + 17 × candidatePairs
+
+        if minLength <= 3:
+            costPerCandidate = 0.1
+        else if minLength <= 25:
+            costPerCandidate = 1.5
+        else:
+            costPerCandidate = 8.0
+
+        return costPerCandidate × candidatePairs
+
+estimateGrayScottNEff(f, k, seedMode, maxIterations):
+
+    if k >= 0.07:
+        return min(maxIterations, 150)
+
+    if f >= 0.15:
+        return min(maxIterations, 50)
+
+    if f >= 0.10 and k >= 0.04:
+        return min(maxIterations, 80)
+
+    if f >= 0.06 and k >= 0.06:
+        return min(maxIterations, 120)
+
+    if k <= 0.05 and 0.02 <= f <= 0.06:
+        return maxIterations
+
+    return maxIterations
+
+heuristicAllocatedMemory(workload, params):
+
+    if workload == fractals:
+        return 7_600_000 + 28 × pixels
+
+    if workload == grayScott:
+        return 860_000 + 60 * size * size
+
+    if workload == dna:
+        return estimateDnaAllocatedMemory(seq1Length, seq2Length, minLength)
+
+estimateDnaAllocatedMemory(seq1Length, seq2Length, minLength):
+    seq1Candidates = max(0, seq1Length - minLength + 1)
+    seq2Candidates = max(0, seq2Length - minLength + 1)
+    candidatePairs = seq1Candidates × seq2Candidates
+
+    return 2_000_000 + 1.1 × minLength × candidatePairs
+
+memoryAllocatedToMemoryUsed(workload, params, allocated):
+
+    if workload == fractals:
+        allocatedMB = allocated / 1024²
+        usedMB = (allocatedMB + 7.645) / 7
+        return usedMB × 1024²
+
+    if workload == dna:
+        usedBytes =
+            71974.8236086406
+            + 7.049843718146969e-07 × allocated
+            - 6.787910281059149e-19 × allocated²
+            - 3.164300911925921e-10 × allocated × minLength
+            - 4.979366655531984e-13 × minLength²
+
+        return max(0, usedBytes)
+
+    if workload == grayScott:
+        usedBytes = 14.875 × allocated - 10_000_000
+        return max(0, usedBytes)
+
+
+# Core definitions
+
+RequestPrediction:
+    estimatedInstructions
+    estimatedMemoryUsed
+
+outstandingEstimatedLoad(worker)
+    = sum estimatedInstructions of active requests assigned to worker
+
+outstandingEstimatedMemory(worker)
+    = sum estimatedMemoryUsed of active requests assigned to worker
+
+activeRequestCount(worker)
+    = number of active requests currently assigned to worker
+
+EC2_CAPACITY
+    = maximum safe predicted instruction load assigned concurrently to one EC2 worker,
+      calibrated experimentally from t3.micro latency/throughput.
+
+EC2_MEMORY_CAPACITY
+    = safe memory budget per EC2 worker, below total available memory to leave room
+      for JVM, OS, server, and instrumentation overhead.
+
+clusterUtilization
+    = totalOutstandingEstimatedLoad / (numberOfActiveWorkers × EC2_CAPACITY)
+
+workerUtilization(worker)
+    = outstandingEstimatedLoad(worker) / EC2_CAPACITY
+
+LAMBDA_COST_THRESHOLD
+    = maximum predicted instruction cost allowed for Lambda.
+
+LAMBDA_MEMORY_THRESHOLD
+    = maximum predicted memory usage allowed for Lambda.
+
+lambdaSuitable(request, prediction)
+    = prediction.estimatedInstructions <= LAMBDA_COST_THRESHOLD
+      and prediction.estimatedMemoryUsed <= LAMBDA_MEMORY_THRESHOLD
+      and request payload fits Lambda limits
+      and estimated runtime fits Lambda timeout

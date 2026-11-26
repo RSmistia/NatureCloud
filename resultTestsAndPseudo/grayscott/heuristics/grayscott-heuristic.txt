@@ -1,0 +1,26 @@
+instructions    = 273 × size² × N_eff
+memory_accesses = 26  × size² × N_eff
+
+N_eff is estimated from F and K:
+
+estimateGrayScottNEff(f, k, seedMode, maxIterations):
+
+    if k >= 0.07:			// Very high kill rate usually leads to quick extinction.
+        return min(maxIterations, 150)
+
+    if f >= 0.15:			// Very high feed rate usually also dies quickly.
+        return min(maxIterations, 50)
+
+    if f >= 0.10 and k >= 0.04:		
+        return min(maxIterations, 80)
+
+    if f >= 0.06 and k >= 0.06:		// High-ish feed and kill tends to be short/medium.
+        return min(maxIterations, 120)
+
+    if k <= 0.05 and 0.02 <= f <= 0.06:
+        return maxIterations
+
+    return maxIterations     // conservative fallback
+
+estimate_grayscott_allocated_bytes(size):
+    return int(860_000 + 60 * size * size)

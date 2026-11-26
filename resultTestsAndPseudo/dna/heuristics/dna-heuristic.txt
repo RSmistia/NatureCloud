@@ -1,0 +1,38 @@
+estimate_dna_instructions(seq1_len, seq2_len, min_length, stop_on_first):
+    seq1_candidates = max(0, seq1_len - min_length + 1)
+    seq2_candidates = max(0, seq2_len - min_length + 1)
+    candidate_pairs = seq1_candidates * seq2_candidates
+
+    # No valid substring comparison is possible.
+    if candidate_pairs == 0:
+        return 200
+
+    # Very small seeds usually match almost immediately.
+    # In the measurements, this stays very small even for large sequences.
+    if stop_on_first and min_length <= 3:
+        return 2_000
+
+    # Clear early-stop case: cost is dominated by scanning seq2.
+    if stop_on_first and min_length <= 25:
+        return int(155 * seq2_len)
+
+    # Large minLength: cost is well explained by candidate comparisons.
+    if min_length >= 100:
+        return int(200 + 17 * candidate_pairs)
+
+    # General middle region: content-dependent, so use coarse buckets.
+    if min_length <= 3:
+        cost_per_candidate = 0.1
+    elif min_length <= 25:
+        cost_per_candidate = 1.5
+    else:  # 25 < min_length < 100
+        cost_per_candidate = 8.0
+
+    return int(cost_per_candidate * candidate_pairs)
+
+estimate_dna_allocated_bytes(seq1_len, seq2_len, min_length, stop_on_first):
+    seq1_candidates = max(0, seq1_len - min_length + 1)
+    seq2_candidates = max(0, seq2_len - min_length + 1)
+    candidate_pairs = seq1_candidates * seq2_candidates
+
+    return int(2_000_000 + 1.1 * min_length * candidate_pairs)

@@ -1,0 +1,11 @@
+**memory allocated to memory used:**
+Fractals:
+> allocatedBytes ~= 7_600_000 + 28 * pixels
+> f(allocatedMB) = (allocatedMB + 7.645)/7 -> da memory used in MegaBytes
+
+DNA:
+> f(allocated, min_length) = 71974.8236086406 + 7.049843718146969*10^-07 * allocated - 6.787910281059149*10^-19 * allocated ^2 - 3.164300911925921*10^-10 * allocated * min_length - 4.979366655531984*10^-13 * min_length^2 -> da memory used in Bytes
+
+GrayScott:
+> allocated ~= 14.875 * used - 10_000_000
+> f(allocated) = (allocated + 10_000_000) / 14.875 -> da memory used in Bytes

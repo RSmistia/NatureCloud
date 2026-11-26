@@ -1,0 +1,43 @@
+estimate_fractal_instructions(width, height, iterations):
+    pixels = width * height
+
+    if iterations <= 1:
+        instructions_per_pixel = 160
+    elif iterations <= 10:
+        instructions_per_pixel = 460
+    elif iterations <= 25:
+        instructions_per_pixel = 740
+    elif iterations <= 50:
+        instructions_per_pixel = 1090
+    elif iterations <= 100:
+        instructions_per_pixel = 1440
+    elif iterations <= 250:
+        instructions_per_pixel = 1650
+    else:
+        instructions_per_pixel = 1660
+
+    return pixels * instructions_per_pixel
+
+estimate_fractal_memory_accesses(width, height, iterations):
+    pixels = width * height
+
+    if iterations <= 1:
+        accesses_per_pixel = 2
+    elif iterations <= 10:
+        accesses_per_pixel = 6
+    elif iterations <= 25:
+        accesses_per_pixel = 11
+    elif iterations <= 50:
+        accesses_per_pixel = 16
+    elif iterations <= 100:
+        accesses_per_pixel = 21
+    elif iterations <= 250:
+        accesses_per_pixel = 25
+    else:
+        accesses_per_pixel = 25
+
+    return pixels * accesses_per_pixel
+
+estimate_fractal_allocated_bytes(width, height):
+    pixels = width * height
+    return int(7_600_000 + 28 * pixels)

@@ -1,0 +1,145 @@
+Gray-Scott calibration and workload-cost model
+==============================================
+
+Goal
+----
+
+Gray-Scott requests are CPU-heavy simulations whose cost is mostly determined
+by the grid size and by the effective number of iterations executed. The LB
+predicts stable complexity first, then converts it into normalized worker load
+using the common capacity model.
+
+The calibration workbook is:
+
+    lb_as/calibration/grayscott-calibration-metrics.xlsx
+
+Calibration data
+----------------
+
+The calibration was run through the instrumented local WebServer. For each
+request we collected:
+
+    size
+    maxIterations
+    f
+    k
+    stopOnExtinction
+    seedMode
+    instructions
+    memoryAccesses
+    allocatedBytes
+    durationMillis
+
+durationMillis is calibration-only. It is not stored in MSS as an operational
+complexity metric.
+
+What we learned
+---------------
+
+Gray-Scott duration is almost linear in measured instruction count. Memory
+accesses are also large, but they are nearly perfectly correlated with
+instructions:
+
+    corr(instructions, memoryAccesses) ~= 0.9999998
+
+Because of this, memory accesses do not add an independent signal to the
+workload-cost model. The final workloadCost uses instructions only.
+
+Fitted duration evidence
+------------------------
+
+The Excel regression fitted:
+
+    localMs ~= 3.5584027 + 1.81555916048485e-7 * instructions
+
+Equivalent million-instruction form:
+
+    localMs ~= 3.5584 + 0.181556 * instructionsMillions
+
+Calibration quality using measured instructions:
+
+    rows: 72
+    R^2:  ~0.9998
+    MAE:  ~23 ms
+    RMSE: ~58 ms
+
+Cold-start complexity heuristic
+-------------------------------
+
+When there are not enough MSS samples for a region, the LB estimates
+instructions from the request parameters:
+
+    instructions = 273 * size^2 * N_eff
+
+and memory accesses as:
+
+    memoryAccesses = 26 * size^2 * N_eff
+
+N_eff is the effective number of iterations. If stopOnExtinction is false, the
+simulation is assumed to run all iterations:
+
+    N_eff = maxIterations
+
+If stopOnExtinction is true, high feed/kill parameters may terminate earlier:
+
+    if k >= 0.07:
+        N_eff = min(maxIterations, 150)
+    else if f >= 0.15:
+        N_eff = min(maxIterations, 50)
+    else if f >= 0.10 and k >= 0.04:
+        N_eff = min(maxIterations, 80)
+    else if f >= 0.06 and k >= 0.06:
+        N_eff = min(maxIterations, 120)
+    else:
+        N_eff = maxIterations
+
+Using this heuristic-instruction estimate, the calibration workbook observed:
+
+    R^2:  ~0.9913
+    MAE:  ~129 ms
+    RMSE: ~382 ms
+
+This is less precise than measured instructions, but it is good enough for
+cold-start scheduling and improves after MSS region averages are available.
+
+Runtime workloadCost
+--------------------
+
+The fitted local-duration model is useful as evidence:
+
+    localMs = 3.5584 + 0.181556 * instructions / 1_000_000
+
+The memory-access coefficient is zero for Gray-Scott because memory accesses
+are redundant with instructions in this calibration set.
+
+For the final normalized-capacity model, the deployed Gray-Scott workloadCost
+is simply:
+
+    workloadCost = instructions / 1_000_000
+
+The EC2 slowdown factor and worker saturation capacity are applied later in
+the common workload-cost-and-capacity model.
+
+Memory estimate
+---------------
+
+Gray-Scott memory is handled separately from CPU time. The allocated-byte
+heuristic is:
+
+    allocatedBytes ~= 860_000 + 60 * size^2
+
+The estimated live/used memory is:
+
+    usedBytes ~= (allocatedBytes + 10_000_000) / 14.875
+
+This conversion is intentionally not the reverse. The measured relation was
+approximately:
+
+    allocated ~= 14.875 * used - 10_000_000
+
+so:
+
+    used ~= (allocated + 10_000_000) / 14.875
+
+The LB then applies the global memory safety factor before comparing against
+the worker memory capacity.
